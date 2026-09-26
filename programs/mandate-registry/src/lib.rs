@@ -132,6 +132,37 @@ pub mod mandate_registry {
         msg!("Mandate revoked: {:?}", &mandate.mandate_id[..8]);
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // transfer_authority - rotate the operator key without redeploying
+    // ------------------------------------------------------------------------
+    // Moves the operator authority stored in the config PDA to a new wallet.
+    // Mirrors `transfer_authority` in agent-registry, which has had it since the
+    // first release. These two programs did not, so the only way to rotate a
+    // compromised operator key was to redeploy under new program ids, breaking
+    // every existing on-chain reference.
+    //
+    // SECURITY:
+    //   - Only the current authority can transfer (has_one on the context)
+    //   - Cannot transfer to the zero address
+    //   - The BPF upgrade authority is a separate key and is unaffected
+    // ------------------------------------------------------------------------
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        require!(
+            new_authority != Pubkey::default(),
+            MandateError::InvalidAuthority
+        );
+
+        let config = &mut ctx.accounts.config;
+        let old = config.authority;
+        config.authority = new_authority;
+
+        msg!("Authority transferred: {} -> {}", old, new_authority);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -253,8 +284,29 @@ pub struct MandateRevoked {
 // ERRORS
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// TransferAuthority - accounts needed by `transfer_authority`
+// ---------------------------------------------------------------------------
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [b"config"],
+        bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, MandateConfig>,
+
+    pub authority: Signer<'info>,
+}
+
 #[error_code]
 pub enum MandateError {
     #[msg("Mandate is already revoked")]
     AlreadyRevoked,
+
+    /// Added 2026-09: appended, not inserted, so the numeric codes of the
+    /// variants above are unchanged for anything already matching on them.
+    #[msg("New authority cannot be the zero address")]
+    InvalidAuthority,
 }

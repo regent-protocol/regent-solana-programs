@@ -67,21 +67,24 @@ verification time:
 ## Status and security
 
 **Devnet.** `audit-anchor` has been anchoring production audit batches since
-12 April 2026: 160 anchor transactions, zero failures, as of 25 September 2026.
+12 April 2026, with no failed anchor transaction to date.
 Mainnet deployment is planned *after* an independent security review, not before.
 
-Three things a reader should know rather than discover:
+Each program keeps two separate authorities, and both were rotated in
+September 2026 onto keys that have never been in a repository:
 
-1. **No independent audit yet.** These programs have not been reviewed by a
-   third party. Commissioning that review is the reason mainnet is not the next
-   step.
-2. **Upgrade authority** for all three programs was moved to an offline key on
-   25 September 2026. It has never been in a repository.
-3. **Operator authority** — the key that may write records — is still a key that
-   appeared in the history of a private repository. Only `agent-registry` has a
-   `transfer_authority` instruction today; adding one to `audit-anchor` and
-   `mandate-registry` so the operator can be rotated without redeploying is the
-   next change to these programs.
+- **Upgrade authority** may replace the program's code. Moved to an offline key
+  on 25 September.
+- **Operator authority** may write records. It lives in the `config` PDA and
+  gates every writing instruction through `has_one = authority`. Moved on
+  26 September, once `transfer_authority` existed in all three programs —
+  `agent-registry` had it from the first release, the other two did not, which
+  meant the only way to rotate their operator was to redeploy under new program
+  ids and break every existing on-chain reference.
+
+One thing a reader should know rather than discover: **these programs have not
+been reviewed by a third party.** Commissioning that review is the reason
+mainnet is not the next step.
 
 There is no token, no treasury and nothing custodial in this repository.
 
