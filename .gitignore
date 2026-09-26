@@ -1,0 +1,9 @@
+target/
+.anchor/
+node_modules/
+test-ledger/
+*.log
+.DS_Store
+
+# Program keypairs determine deployment addresses — never commit them.
+**/*-keypair.json

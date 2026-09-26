@@ -1,0 +1,30 @@
+# ============================================================================
+# Cargo.toml — Rust workspace root for all Regent Solana programs
+# ============================================================================
+#
+# This is a Cargo WORKSPACE — it groups multiple Rust crates (programs)
+# under a single build. Each program in programs/ is a separate crate
+# with its own Cargo.toml, but they share a single target/ directory
+# and dependency resolver.
+
+[workspace]
+members = [
+    "programs/agent-registry",
+    "programs/audit-anchor",
+    "programs/mandate-registry",
+]
+
+# Use the Anchor framework's resolver for consistent dependency resolution
+resolver = "2"
+
+[workspace.dependencies]
+anchor-lang = "0.31.1"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
