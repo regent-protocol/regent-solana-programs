@@ -163,6 +163,38 @@ pub mod mandate_registry {
         msg!("Authority transferred: {} -> {}", old, new_authority);
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Admin / operator split (ADR-017, 2026-10)
+    // ------------------------------------------------------------------------
+    // `config.authority` is the OPERATOR: the hot key blockchain-worker signs every
+    // write with. `AdminConfig.admin` is the ADMIN: a multisig (Squads) on mainnet,
+    // the offline upgrade key on devnet. Only the admin may rotate the operator or
+    // hand over admin. A compromised operator key can therefore write records but
+    // can neither lock the protocol out nor change who is in charge.
+    //
+    // Migration-friendly: the admin lives in its own PDA ([b"admin"]) so existing
+    // config accounts keep their layout. `init_admin` is the one-time bootstrap,
+    // signed by the current operator; from then on `transfer_authority` is
+    // admin-gated.
+    // ------------------------------------------------------------------------
+    pub fn init_admin(ctx: Context<InitAdmin>, admin: Pubkey) -> Result<()> {
+        require!(admin != Pubkey::default(), MandateError::InvalidAuthority);
+        let admin_config = &mut ctx.accounts.admin_config;
+        admin_config.admin = admin;
+        admin_config.bump = ctx.bumps.admin_config;
+        msg!("Admin initialized: {}", admin);
+        Ok(())
+    }
+
+    pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
+        require!(new_admin != Pubkey::default(), MandateError::InvalidAuthority);
+        let admin_config = &mut ctx.accounts.admin_config;
+        let old = admin_config.admin;
+        admin_config.admin = new_admin;
+        msg!("Admin transferred: {} -> {}", old, new_admin);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -182,7 +214,14 @@ pub struct MandateConfig {
 pub struct Mandate {
     /// Unique identifier for this mandate.
     pub mandate_id: [u8; 32],       // 32 bytes
-    /// Which agent this mandate authorizes to spend.
+    /// Which agent this mandate authorizes to spend: the same 32-byte reference
+    /// the agent registry uses as the agent's PDA seed (sha256 of the agent id).
+    ///
+    /// The mandate's TERMS are deliberately not here. Their salted commitment
+    /// (`mandate_hash`) rides in every allow token, completion receipt and audit
+    /// event, and the audit chain proves that trail is complete and ordered — so a
+    /// commitment in this account would be redundant, and adding one would change
+    /// the layout of accounts already written.
     pub agent_id: [u8; 32],         // 32 bytes
     /// Unix timestamp of registration.
     pub registered_at: i64,         // 8 bytes
@@ -266,6 +305,58 @@ pub struct RevokeMandate<'info> {
 // EVENTS
 // ============================================================================
 
+
+// ---------------------------------------------------------------------------
+// AdminConfig — who may rotate the operator (ADR-017)
+// ---------------------------------------------------------------------------
+#[account]
+#[derive(InitSpace)]
+pub struct AdminConfig {
+    /// The admin key: a multisig on mainnet, the offline upgrade key on devnet.
+    pub admin: Pubkey,              // 32 bytes
+    /// PDA bump seed.
+    pub bump: u8,                   // 1 byte
+}
+// Total: 8 + 32 + 1 = 41 bytes
+
+#[derive(Accounts)]
+pub struct InitAdmin<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, MandateConfig>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + AdminConfig::INIT_SPACE,
+        seeds = [b"admin"],
+        bump
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    /// The current operator bootstraps the admin exactly once (init fails after).
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct TransferAdmin<'info> {
+    #[account(
+        mut,
+        seeds = [b"admin"],
+        bump = admin_config.bump,
+        has_one = admin
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    pub admin: Signer<'info>,
+}
+
 #[event]
 pub struct MandateRegistered {
     pub mandate_id: [u8; 32],
@@ -292,12 +383,20 @@ pub struct TransferAuthority<'info> {
     #[account(
         mut,
         seeds = [b"config"],
-        bump,
-        has_one = authority
+        bump
     )]
     pub config: Account<'info, MandateConfig>,
 
-    pub authority: Signer<'info>,
+    /// Operator rotation is an ADMIN action (ADR-017): the admin PDA must exist
+    /// and the admin must sign. The operator key alone cannot rotate itself.
+    #[account(
+        seeds = [b"admin"],
+        bump = admin_config.bump,
+        has_one = admin
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    pub admin: Signer<'info>,
 }
 
 #[error_code]

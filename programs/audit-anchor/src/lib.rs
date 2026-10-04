@@ -35,6 +35,7 @@
 // ============================================================================
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::hash::hashv;
 
 declare_id!("8N1PpbJZKmvJjG86XWpP82XrWzp8HY5FHZuzyQTgjJas");
 
@@ -159,6 +160,121 @@ pub mod audit_anchor {
         msg!("Authority transferred: {} -> {}", old, new_authority);
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Admin / operator split (ADR-017, 2026-10)
+    // ------------------------------------------------------------------------
+    // `config.authority` is the OPERATOR: the hot key blockchain-worker signs every
+    // write with. `AdminConfig.admin` is the ADMIN: a multisig (Squads) on mainnet,
+    // the offline upgrade key on devnet. Only the admin may rotate the operator or
+    // hand over admin. A compromised operator key can therefore write records but
+    // can neither lock the protocol out nor change who is in charge.
+    //
+    // Migration-friendly: the admin lives in its own PDA ([b"admin"]) so existing
+    // config accounts keep their layout. `init_admin` is the one-time bootstrap,
+    // signed by the current operator; from then on `transfer_authority` is
+    // admin-gated.
+    // ------------------------------------------------------------------------
+    pub fn init_admin(ctx: Context<InitAdmin>, admin: Pubkey) -> Result<()> {
+        require!(admin != Pubkey::default(), AnchorError::InvalidAuthority);
+        let admin_config = &mut ctx.accounts.admin_config;
+        admin_config.admin = admin;
+        admin_config.bump = ctx.bumps.admin_config;
+        msg!("Admin initialized: {}", admin);
+        Ok(())
+    }
+
+    pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
+        require!(new_admin != Pubkey::default(), AnchorError::InvalidAuthority);
+        let admin_config = &mut ctx.accounts.admin_config;
+        let old = admin_config.admin;
+        admin_config.admin = new_admin;
+        msg!("Admin transferred: {} -> {}", old, new_admin);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Audit chain (ADR-017, 2026-10): one account for every batch, forever
+    // ------------------------------------------------------------------------
+    // `anchor_batch` above creates a rent-exempt account PER BATCH, so the cost
+    // grows with the number of batches and never comes back. The chain keeps ONE
+    // account: `head = sha256(head_prev ‖ batch_root ‖ seq_le)` on every batch,
+    // with a strictly sequential `seq`. The head commits to the whole ordered
+    // history, a missing or reordered batch changes it, and a gap in `seq` is
+    // rejected on chain — nothing can be skipped. Cost per batch: one tx fee.
+    //
+    // Epochs give short proofs: every N batches (or every day) a Merkle root over
+    // the batch roots of the range [first_seq, last_seq] is stored in its own
+    // small account, so verifying one event is two Merkle paths (event → batch
+    // root → epoch root) without replaying the chain.
+    // ------------------------------------------------------------------------
+    pub fn init_chain(ctx: Context<InitChain>) -> Result<()> {
+        let chain = &mut ctx.accounts.chain;
+        chain.head = [0u8; 32];
+        chain.seq = 0;
+        chain.last_appended_at = 0;
+        chain.epoch_count = 0;
+        chain.last_epoch_end_seq = 0;
+        chain.bump = ctx.bumps.chain;
+        msg!("AuditChain initialized");
+        Ok(())
+    }
+
+    pub fn append_batch(
+        ctx: Context<AppendBatch>,
+        batch_root: [u8; 32],
+        seq: u64,
+        prev_head: [u8; 32],
+    ) -> Result<()> {
+        require!(batch_root != [0u8; 32], AnchorError::InvalidMerkleRoot);
+        let chain = &mut ctx.accounts.chain;
+        let expected = chain.seq.checked_add(1).unwrap();
+        require!(seq == expected, AnchorError::SequenceMismatch);
+        // The caller states which head it believes it is extending. Without this a client
+        // whose own record of the chain has diverged would still append happily, and the
+        // head would commit to a batch series nobody can reproduce. Mismatch fails loudly.
+        require!(prev_head == chain.head, AnchorError::HeadMismatch);
+
+        let clock = Clock::get()?;
+        let head = hashv(&[&chain.head, &batch_root, &seq.to_le_bytes()]).to_bytes();
+        chain.head = head;
+        chain.seq = seq;
+        chain.last_appended_at = clock.unix_timestamp;
+
+        emit!(BatchAppended { seq, batch_root, head, timestamp: clock.unix_timestamp });
+        msg!("Batch appended: seq={}", seq);
+        Ok(())
+    }
+
+    pub fn anchor_epoch(
+        ctx: Context<AnchorEpoch>,
+        epoch_index: u64,
+        first_seq: u64,
+        last_seq: u64,
+        merkle_root: [u8; 32],
+    ) -> Result<()> {
+        require!(merkle_root != [0u8; 32], AnchorError::InvalidMerkleRoot);
+        let chain = &mut ctx.accounts.chain;
+        require!(epoch_index == chain.epoch_count.checked_add(1).unwrap(), AnchorError::EpochIndexMismatch);
+        require!(first_seq == chain.last_epoch_end_seq.checked_add(1).unwrap(), AnchorError::EpochNotContiguous);
+        require!(last_seq >= first_seq && last_seq <= chain.seq, AnchorError::EpochOutOfRange);
+
+        let clock = Clock::get()?;
+        let epoch = &mut ctx.accounts.epoch;
+        epoch.epoch_index = epoch_index;
+        epoch.first_seq = first_seq;
+        epoch.last_seq = last_seq;
+        epoch.merkle_root = merkle_root;
+        epoch.anchored_at = clock.unix_timestamp;
+        epoch.bump = ctx.bumps.epoch;
+
+        chain.epoch_count = epoch_index;
+        chain.last_epoch_end_seq = last_seq;
+
+        emit!(EpochAnchored { epoch_index, first_seq, last_seq, merkle_root, timestamp: clock.unix_timestamp });
+        msg!("Epoch anchored: index={} seq=[{}, {}]", epoch_index, first_seq, last_seq);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -247,11 +363,193 @@ pub struct AnchorBatch<'info> {
 // EVENTS
 // ============================================================================
 
+
+// ---------------------------------------------------------------------------
+// AdminConfig — who may rotate the operator (ADR-017)
+// ---------------------------------------------------------------------------
+#[account]
+#[derive(InitSpace)]
+pub struct AdminConfig {
+    /// The admin key: a multisig on mainnet, the offline upgrade key on devnet.
+    pub admin: Pubkey,              // 32 bytes
+    /// PDA bump seed.
+    pub bump: u8,                   // 1 byte
+}
+// Total: 8 + 32 + 1 = 41 bytes
+
+#[derive(Accounts)]
+pub struct InitAdmin<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, AnchorConfig>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + AdminConfig::INIT_SPACE,
+        seeds = [b"admin"],
+        bump
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    /// The current operator bootstraps the admin exactly once (init fails after).
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct TransferAdmin<'info> {
+    #[account(
+        mut,
+        seeds = [b"admin"],
+        bump = admin_config.bump,
+        has_one = admin
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    pub admin: Signer<'info>,
+}
+
+// ---------------------------------------------------------------------------
+// AuditChain — the single running head over every batch (ADR-017)
+// ---------------------------------------------------------------------------
+#[account]
+#[derive(InitSpace)]
+pub struct AuditChain {
+    /// sha256(head_prev ‖ batch_root ‖ seq_le) after the latest batch; zeros before the first.
+    pub head: [u8; 32],                  // 32 bytes
+    /// Sequence number of the latest appended batch (0 = none yet). Strictly +1 per append.
+    pub seq: u64,                        // 8 bytes
+    /// Unix timestamp of the latest append.
+    pub last_appended_at: i64,           // 8 bytes
+    /// Number of epochs anchored so far.
+    pub epoch_count: u64,                // 8 bytes
+    /// `last_seq` of the latest epoch (0 = none yet); the next epoch must start at +1.
+    pub last_epoch_end_seq: u64,         // 8 bytes
+    /// PDA bump seed.
+    pub bump: u8,                        // 1 byte
+}
+// Total: 8 + 32 + 8 + 8 + 8 + 8 + 1 = 73 bytes
+
+#[account]
+#[derive(InitSpace)]
+pub struct Epoch {
+    /// 1-based epoch number; PDA seed.
+    pub epoch_index: u64,                // 8 bytes
+    /// Batch sequence range covered, inclusive and contiguous with the previous epoch.
+    pub first_seq: u64,                  // 8 bytes
+    pub last_seq: u64,                   // 8 bytes
+    /// Merkle root over the batch roots of [first_seq, last_seq] (leaf i = seq first_seq + i).
+    pub merkle_root: [u8; 32],           // 32 bytes
+    /// Unix timestamp when the epoch was anchored.
+    pub anchored_at: i64,                // 8 bytes
+    /// PDA bump seed.
+    pub bump: u8,                        // 1 byte
+}
+// Total: 8 + 8 + 8 + 8 + 32 + 8 + 1 = 73 bytes
+
+#[derive(Accounts)]
+pub struct InitChain<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, AnchorConfig>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + AuditChain::INIT_SPACE,
+        seeds = [b"chain"],
+        bump
+    )]
+    pub chain: Account<'info, AuditChain>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AppendBatch<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, AnchorConfig>,
+
+    #[account(
+        mut,
+        seeds = [b"chain"],
+        bump = chain.bump
+    )]
+    pub chain: Account<'info, AuditChain>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch_index: u64)]
+pub struct AnchorEpoch<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, AnchorConfig>,
+
+    #[account(
+        mut,
+        seeds = [b"chain"],
+        bump = chain.bump
+    )]
+    pub chain: Account<'info, AuditChain>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Epoch::INIT_SPACE,
+        seeds = [b"epoch", epoch_index.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub epoch: Account<'info, Epoch>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 #[event]
 pub struct BatchAnchored {
     pub batch_id: [u8; 32],
     pub merkle_root: [u8; 32],
     pub event_count: u32,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct BatchAppended {
+    pub seq: u64,
+    pub batch_root: [u8; 32],
+    pub head: [u8; 32],
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct EpochAnchored {
+    pub epoch_index: u64,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub merkle_root: [u8; 32],
     pub timestamp: i64,
 }
 
@@ -267,12 +565,20 @@ pub struct TransferAuthority<'info> {
     #[account(
         mut,
         seeds = [b"config"],
-        bump,
-        has_one = authority
+        bump
     )]
     pub config: Account<'info, AnchorConfig>,
 
-    pub authority: Signer<'info>,
+    /// Operator rotation is an ADMIN action (ADR-017): the admin PDA must exist
+    /// and the admin must sign. The operator key alone cannot rotate itself.
+    #[account(
+        seeds = [b"admin"],
+        bump = admin_config.bump,
+        has_one = admin
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    pub admin: Signer<'info>,
 }
 
 #[error_code]
@@ -289,4 +595,20 @@ pub enum AnchorError {
     /// variants above are unchanged for anything already matching on them.
     #[msg("New authority cannot be the zero address")]
     InvalidAuthority,
+
+    /// Audit chain (2026-10): appended after the variants above, codes stay stable.
+    #[msg("Batch seq must be exactly chain.seq + 1 (no gaps, no replays)")]
+    SequenceMismatch,
+
+    #[msg("Epoch index must be exactly chain.epoch_count + 1")]
+    EpochIndexMismatch,
+
+    #[msg("Epoch must start right after the previous epoch's last_seq")]
+    EpochNotContiguous,
+
+    #[msg("Epoch range must be non-empty and not beyond the chain head")]
+    EpochOutOfRange,
+
+    #[msg("prev_head does not match the chain head: the caller is extending a different history")]
+    HeadMismatch,
 }

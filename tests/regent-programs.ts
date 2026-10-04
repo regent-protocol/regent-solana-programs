@@ -35,6 +35,14 @@ function findPda(seeds: Buffer[], programId: PublicKey): PublicKey {
   return pda;
 }
 
+function u64le(n: number): Buffer {
+  const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b;
+}
+
+function chainHead(prev: Buffer, root: Buffer, seq: number): Buffer {
+  return createHash("sha256").update(Buffer.concat([prev, root, u64le(seq)])).digest();
+}
+
 async function fund(conn: anchor.web3.Connection, pk: PublicKey) {
   const sig = await conn.requestAirdrop(pk, 2_000_000_000);
   await conn.confirmTransaction(sig);
@@ -71,6 +79,7 @@ describe("agent-registry", () => {
     } catch (e: any) {
       console.log("AgentRegistry init:", e.message?.slice(0, 100) || "skip");
     }
+    try { await program.methods.initAdmin(authority.publicKey).rpc(); } catch (_) {}
   });
 
   it("initializes with correct authority", async () => {
@@ -80,13 +89,13 @@ describe("agent-registry", () => {
 
   it("registers an agent successfully", async () => {
     const agentId = makeId("reg");
-    const party = Keypair.generate().publicKey;
+    const party = makeId("owner");
     const agentPda = findPda([Buffer.from("agent"), agentId], program.programId);
 
     const before = (await program.account.registryConfig.fetch(configPda)).totalAgents.toNumber();
 
     await program.methods
-      .registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party)
+      .registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party))
       .accounts({ agent: agentPda })
       .rpc();
 
@@ -94,7 +103,7 @@ describe("agent-registry", () => {
     const agent = await program.account.agent.fetch(agentPda);
     expect(Buffer.from(agent.agentId)).to.deep.equal(agentId);
     expect(Buffer.from(agent.didHash)).to.deep.equal(didHash);
-    expect(agent.responsibleParty.toString()).to.equal(party.toString());
+    expect(Buffer.from(agent.ownerCommitment)).to.deep.equal(party);
     expect(agent.revoked).to.be.false;
     expect(agent.revokedAt).to.be.null;
     expect(agent.registeredAt.toNumber()).to.be.greaterThan(0);
@@ -105,26 +114,26 @@ describe("agent-registry", () => {
 
   it("fails to register duplicate agent_id", async () => {
     const agentId = makeId("dup");
-    const party = Keypair.generate().publicKey;
+    const party = makeId("owner");
     const agentPda = findPda([Buffer.from("agent"), agentId], program.programId);
 
-    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party).accounts({ agent: agentPda }).rpc();
+    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party)).accounts({ agent: agentPda }).rpc();
 
     await expectFail(
-      () => program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party).accounts({ agent: agentPda }).rpc(),
+      () => program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party)).accounts({ agent: agentPda }).rpc(),
       "already in use", "custom program error"
     );
   });
 
   it("rejects registration from unauthorized wallet", async () => {
     const agentId = makeId("unauth");
-    const party = Keypair.generate().publicKey;
+    const party = makeId("owner");
     const agentPda = findPda([Buffer.from("agent"), agentId], program.programId);
     const imposter = Keypair.generate();
     await fund(provider.connection, imposter.publicKey);
 
     await expectFail(
-      () => program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party)
+      () => program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party))
         .accounts({ agent: agentPda, authority: imposter.publicKey })
         .signers([imposter]).rpc(),
       "ConstraintHasOne", "Constraint", "has_one", "failed"
@@ -133,10 +142,10 @@ describe("agent-registry", () => {
 
   it("revokes an agent successfully", async () => {
     const agentId = makeId("rev");
-    const party = Keypair.generate().publicKey;
+    const party = makeId("owner");
     const agentPda = findPda([Buffer.from("agent"), agentId], program.programId);
 
-    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party).accounts({ agent: agentPda }).rpc();
+    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party)).accounts({ agent: agentPda }).rpc();
     await program.methods.revokeAgent(Array.from(agentId)).accounts({ agent: agentPda }).rpc();
 
     const agent = await program.account.agent.fetch(agentPda);
@@ -146,10 +155,10 @@ describe("agent-registry", () => {
 
   it("fails to revoke already-revoked agent", async () => {
     const agentId = makeId("dbl-rev");
-    const party = Keypair.generate().publicKey;
+    const party = makeId("owner");
     const agentPda = findPda([Buffer.from("agent"), agentId], program.programId);
 
-    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party).accounts({ agent: agentPda }).rpc();
+    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party)).accounts({ agent: agentPda }).rpc();
     await program.methods.revokeAgent(Array.from(agentId)).accounts({ agent: agentPda }).rpc();
 
     await expectFail(
@@ -160,12 +169,12 @@ describe("agent-registry", () => {
 
   it("rejects revocation from unauthorized wallet", async () => {
     const agentId = makeId("unauth-rev");
-    const party = Keypair.generate().publicKey;
+    const party = makeId("owner");
     const agentPda = findPda([Buffer.from("agent"), agentId], program.programId);
     const imposter = Keypair.generate();
     await fund(provider.connection, imposter.publicKey);
 
-    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party).accounts({ agent: agentPda }).rpc();
+    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party)).accounts({ agent: agentPda }).rpc();
 
     await expectFail(
       () => program.methods.revokeAgent(Array.from(agentId))
@@ -175,18 +184,28 @@ describe("agent-registry", () => {
     );
   });
 
-  it("transfers authority and transfers back", async () => {
+  it("admin rotates the operator and rotates it back", async () => {
     const newAuth = Keypair.generate();
     await fund(provider.connection, newAuth.publicKey);
 
+    // the admin (test wallet) signs; the operator key is not involved
     await program.methods.transferAuthority(newAuth.publicKey).rpc();
     let config = await program.account.registryConfig.fetch(configPda);
     expect(config.authority.toString()).to.equal(newAuth.publicKey.toString());
 
-    await program.methods.transferAuthority(authority.publicKey)
-      .accounts({ authority: newAuth.publicKey }).signers([newAuth]).rpc();
+    await program.methods.transferAuthority(authority.publicKey).rpc();
     config = await program.account.registryConfig.fetch(configPda);
     expect(config.authority.toString()).to.equal(authority.publicKey.toString());
+  });
+
+  it("rejects operator rotation without the admin signature", async () => {
+    const imposter = Keypair.generate();
+    await fund(provider.connection, imposter.publicKey);
+    await expectFail(
+      () => program.methods.transferAuthority(imposter.publicKey)
+        .accounts({ admin: imposter.publicKey }).signers([imposter]).rpc(),
+      "ConstraintHasOne", "Constraint", "has_one", "failed"
+    );
   });
 
   it("rejects transfer to zero pubkey", async () => {
@@ -196,15 +215,28 @@ describe("agent-registry", () => {
     );
   });
 
+  it("init_admin runs once; transfer_admin hands over and back", async () => {
+    await expectFail(() => program.methods.initAdmin(authority.publicKey).rpc(), "already in use", "custom program error");
+    const adminPda = findPda([Buffer.from("admin")], program.programId);
+    const next = Keypair.generate();
+    await fund(provider.connection, next.publicKey);
+    await program.methods.transferAdmin(next.publicKey).rpc();
+    expect((await program.account.adminConfig.fetch(adminPda)).admin.toString()).to.equal(next.publicKey.toString());
+    // the old admin can no longer rotate the operator
+    await expectFail(() => program.methods.transferAuthority(authority.publicKey).rpc(), "ConstraintHasOne", "Constraint", "has_one", "failed");
+    await program.methods.transferAdmin(authority.publicKey).accounts({ admin: next.publicKey }).signers([next]).rpc();
+    expect((await program.account.adminConfig.fetch(adminPda)).admin.toString()).to.equal(authority.publicKey.toString());
+  });
+
   it("allows anyone to read agent data", async () => {
     const agentId = makeId("read");
-    const party = Keypair.generate().publicKey;
+    const party = makeId("owner");
     const agentPda = findPda([Buffer.from("agent"), agentId], program.programId);
 
-    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), party).accounts({ agent: agentPda }).rpc();
+    await program.methods.registerAgent(Array.from(agentId), Array.from(makeDidHash(agentId)), Array.from(party)).accounts({ agent: agentPda }).rpc();
 
     const agent = await program.account.agent.fetch(agentPda);
-    expect(agent.responsibleParty.toString()).to.equal(party.toString());
+    expect(Buffer.from(agent.ownerCommitment)).to.deep.equal(party);
   });
 });
 
@@ -217,8 +249,89 @@ describe("audit-anchor", () => {
   const program = anchor.workspace.AuditAnchor as Program<AuditAnchor>;
   const configPda = findPda([Buffer.from("config")], program.programId);
 
+  const chainPda = findPda([Buffer.from("chain")], program.programId);
+  const epochPda = (i: number) => findPda([Buffer.from("epoch"), u64le(i)], program.programId);
+
   before(async () => {
     try { await program.methods.initialize().rpc(); } catch (_) {}
+    try { await program.methods.initAdmin(provider.wallet.publicKey).rpc(); } catch (_) {}
+    try { await program.methods.initChain().rpc(); } catch (_) {}
+  });
+
+  it("chain starts at seq 0 with a zero head", async () => {
+    const chain = await program.account.auditChain.fetch(chainPda);
+    expect(chain.seq.toNumber()).to.equal(0);
+    expect(Buffer.from(chain.head)).to.deep.equal(Buffer.alloc(32));
+  });
+
+  it("appends batches strictly in sequence and chains the head", async () => {
+    const r1 = makeId("root-1"), r2 = makeId("root-2");
+    await program.methods.appendBatch(Array.from(r1), new anchor.BN(1), Array.from(Buffer.alloc(32))).rpc();
+    let chain = await program.account.auditChain.fetch(chainPda);
+    const h1 = chainHead(Buffer.alloc(32), r1, 1);
+    expect(Buffer.from(chain.head)).to.deep.equal(h1);
+    expect(chain.seq.toNumber()).to.equal(1);
+
+    await program.methods.appendBatch(Array.from(r2), new anchor.BN(2), Array.from(h1)).rpc();
+    chain = await program.account.auditChain.fetch(chainPda);
+    expect(Buffer.from(chain.head)).to.deep.equal(chainHead(h1, r2, 2));
+    expect(chain.lastAppendedAt.toNumber()).to.be.greaterThan(0);
+  });
+
+  it("rejects a replayed or skipped seq", async () => {
+    const r = makeId("root-x");
+    const head = Array.from((await program.account.auditChain.fetch(chainPda)).head);
+    await expectFail(() => program.methods.appendBatch(Array.from(r), new anchor.BN(2), head).rpc(), "SequenceMismatch");
+    await expectFail(() => program.methods.appendBatch(Array.from(r), new anchor.BN(4), head).rpc(), "SequenceMismatch");
+    await expectFail(() => program.methods.appendBatch(new Array(32).fill(0), new anchor.BN(3), head).rpc(), "InvalidMerkleRoot");
+  });
+
+  it("rejects an append that claims the wrong previous head", async () => {
+    const wrong = Array.from(makeId("not-the-head"));
+    await expectFail(
+      () => program.methods.appendBatch(Array.from(makeId("root-y")), new anchor.BN(3), wrong).rpc(),
+      "HeadMismatch"
+    );
+  });
+
+  it("rejects an append from a non-operator", async () => {
+    const head = Array.from((await program.account.auditChain.fetch(chainPda)).head);
+    const imposter = Keypair.generate();
+    await fund(provider.connection, imposter.publicKey);
+    await expectFail(
+      () => program.methods.appendBatch(Array.from(makeId("r")), new anchor.BN(3), head)
+        .accounts({ authority: imposter.publicKey }).signers([imposter]).rpc(),
+      "ConstraintHasOne", "Constraint", "has_one", "failed"
+    );
+  });
+
+  it("anchors a contiguous epoch over the appended range", async () => {
+    const root = makeId("epoch-1");
+    await program.methods.anchorEpoch(new anchor.BN(1), new anchor.BN(1), new anchor.BN(2), Array.from(root))
+      .accounts({ epoch: epochPda(1) }).rpc();
+    const epoch = await program.account.epoch.fetch(epochPda(1));
+    expect(epoch.firstSeq.toNumber()).to.equal(1);
+    expect(epoch.lastSeq.toNumber()).to.equal(2);
+    expect(Buffer.from(epoch.merkleRoot)).to.deep.equal(root);
+    const chain = await program.account.auditChain.fetch(chainPda);
+    expect(chain.epochCount.toNumber()).to.equal(1);
+    expect(chain.lastEpochEndSeq.toNumber()).to.equal(2);
+  });
+
+  it("rejects epochs that are out of order, non-contiguous or beyond the head", async () => {
+    const root = makeId("epoch-bad");
+    await expectFail(() => program.methods.anchorEpoch(new anchor.BN(1), new anchor.BN(3), new anchor.BN(3), Array.from(root))
+      .accounts({ epoch: epochPda(1) }).rpc(), "already in use", "custom program error", "EpochIndexMismatch");
+    await expectFail(() => program.methods.anchorEpoch(new anchor.BN(2), new anchor.BN(4), new anchor.BN(4), Array.from(root))
+      .accounts({ epoch: epochPda(2) }).rpc(), "EpochNotContiguous");
+    await expectFail(() => program.methods.anchorEpoch(new anchor.BN(2), new anchor.BN(3), new anchor.BN(9), Array.from(root))
+      .accounts({ epoch: epochPda(2) }).rpc(), "EpochOutOfRange");
+    // a valid second epoch after one more append
+    const head3 = Array.from((await program.account.auditChain.fetch(chainPda)).head);
+    await program.methods.appendBatch(Array.from(makeId("root-3")), new anchor.BN(3), head3).rpc();
+    await program.methods.anchorEpoch(new anchor.BN(2), new anchor.BN(3), new anchor.BN(3), Array.from(root))
+      .accounts({ epoch: epochPda(2) }).rpc();
+    expect((await program.account.auditChain.fetch(chainPda)).epochCount.toNumber()).to.equal(2);
   });
 
   it("anchors a batch with valid Merkle root", async () => {
@@ -317,6 +430,7 @@ describe("mandate-registry", () => {
 
   before(async () => {
     try { await program.methods.initialize().rpc(); } catch (_) {}
+    try { await program.methods.initAdmin(provider.wallet.publicKey).rpc(); } catch (_) {}
   });
 
   it("registers a mandate linked to an agent", async () => {

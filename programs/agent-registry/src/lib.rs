@@ -84,7 +84,7 @@ pub mod agent_registry {
     // WHAT HAPPENS:
     //   1. Solana runtime creates a new account (paid by authority)
     //   2. The account address is derived from: seeds = ["agent", agent_id]
-    //   3. We store agent_id, responsible_party, timestamp, revoked=false
+    //   3. We store agent_id, owner_commitment, timestamp, revoked=false
     //   4. We emit an AgentRegistered event
     //   5. We increment the global agent counter
     //
@@ -92,7 +92,8 @@ pub mod agent_registry {
     //   - Only the authority can call this (enforced by `has_one` constraint)
     //   - The same agent_id cannot be registered twice (PDA is deterministic —
     //     trying to init the same seeds fails with "already in use")
-    //   - responsible_party is a Pubkey — it identifies WHO is accountable
+    //   - owner_commitment is sha256(owner account id) — the seed of that owner's
+    //     UserAccount PDA, never a wallet address
     //
     // COST:
     //   ~0.001 SOL tx fee + ~0.002 SOL rent deposit (refundable)
@@ -100,13 +101,13 @@ pub mod agent_registry {
     // PARAMS:
     //   agent_id           — 32-byte unique identifier for the agent
     //   did_hash           — SHA-256 hash of the W3C DID string
-    //   responsible_party  — Pubkey of the human/company responsible
+    //   owner_commitment  — sha256(owner account id); resolves to the owner's UserAccount
     // ------------------------------------------------------------------------
     pub fn register_agent(
         ctx: Context<RegisterAgent>,
         agent_id: [u8; 32],
         did_hash: [u8; 32],
-        responsible_party: Pubkey,
+        owner_commitment: [u8; 32],
     ) -> Result<()> {
         let agent = &mut ctx.accounts.agent;
         let clock = Clock::get()?;
@@ -114,7 +115,7 @@ pub mod agent_registry {
         // Store agent data in the PDA account
         agent.agent_id = agent_id;
         agent.did_hash = did_hash;
-        agent.responsible_party = responsible_party;
+        agent.owner_commitment = owner_commitment;
         agent.registered_at = clock.unix_timestamp;
         agent.revoked = false;
         agent.bump = ctx.bumps.agent;
@@ -127,15 +128,11 @@ pub mod agent_registry {
         emit!(AgentRegistered {
             agent_id,
             did_hash,
-            responsible_party,
+            owner_commitment,
             timestamp: clock.unix_timestamp,
         });
 
-        msg!(
-            "Agent registered: {:?}, responsible: {}",
-            agent_id,
-            responsible_party
-        );
+        msg!("Agent registered: {:?} owner_commitment={:?}", &agent_id[..8], &owner_commitment[..8]);
         Ok(())
     }
 
@@ -210,6 +207,38 @@ pub mod agent_registry {
         config.authority = new_authority;
 
         msg!("Authority transferred: {} -> {}", old, new_authority);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Admin / operator split (ADR-017, 2026-10)
+    // ------------------------------------------------------------------------
+    // `config.authority` is the OPERATOR: the hot key blockchain-worker signs every
+    // write with. `AdminConfig.admin` is the ADMIN: a multisig (Squads) on mainnet,
+    // the offline upgrade key on devnet. Only the admin may rotate the operator or
+    // hand over admin. A compromised operator key can therefore write records but
+    // can neither lock the protocol out nor change who is in charge.
+    //
+    // Migration-friendly: the admin lives in its own PDA ([b"admin"]) so existing
+    // config accounts keep their layout. `init_admin` is the one-time bootstrap,
+    // signed by the current operator; from then on `transfer_authority` is
+    // admin-gated.
+    // ------------------------------------------------------------------------
+    pub fn init_admin(ctx: Context<InitAdmin>, admin: Pubkey) -> Result<()> {
+        require!(admin != Pubkey::default(), AgentError::InvalidAuthority);
+        let admin_config = &mut ctx.accounts.admin_config;
+        admin_config.admin = admin;
+        admin_config.bump = ctx.bumps.admin_config;
+        msg!("Admin initialized: {}", admin);
+        Ok(())
+    }
+
+    pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
+        require!(new_admin != Pubkey::default(), AgentError::InvalidAuthority);
+        let admin_config = &mut ctx.accounts.admin_config;
+        let old = admin_config.admin;
+        admin_config.admin = new_admin;
+        msg!("Admin transferred: {} -> {}", old, new_admin);
         Ok(())
     }
 
@@ -300,8 +329,9 @@ pub struct Agent {
     /// SHA-256 hash of the W3C DID string (did:regent:{chain}:{agent_id}).
     /// Enables on-chain DID verification without storing the full DID string.
     pub did_hash: [u8; 32],             // 32 bytes
-    /// The human/company responsible for this agent's actions.
-    pub responsible_party: Pubkey,       // 32 bytes
+    /// Commitment to the responsible owner: sha256(owner account id), which is
+    /// the `[b"user", hash]` seed of the owner's UserAccount. Never the raw id.
+    pub owner_commitment: [u8; 32],      // 32 bytes
     /// Unix timestamp when this agent was registered.
     pub registered_at: i64,              // 8 bytes
     /// Whether this agent has been permanently revoked.
@@ -455,12 +485,20 @@ pub struct TransferAuthority<'info> {
     #[account(
         mut,
         seeds = [b"config"],
-        bump,
-        has_one = authority
+        bump
     )]
     pub config: Account<'info, RegistryConfig>,
 
-    pub authority: Signer<'info>,
+    /// Operator rotation is an ADMIN action (ADR-017): the admin PDA must exist
+    /// and the admin must sign. The operator key alone cannot rotate itself.
+    #[account(
+        seeds = [b"admin"],
+        bump = admin_config.bump,
+        has_one = admin
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    pub admin: Signer<'info>,
 }
 
 // ---------------------------------------------------------------------------
@@ -500,11 +538,63 @@ pub struct RegisterUser<'info> {
 // They cost almost nothing to emit.
 // ============================================================================
 
+
+// ---------------------------------------------------------------------------
+// AdminConfig — who may rotate the operator (ADR-017)
+// ---------------------------------------------------------------------------
+#[account]
+#[derive(InitSpace)]
+pub struct AdminConfig {
+    /// The admin key: a multisig on mainnet, the offline upgrade key on devnet.
+    pub admin: Pubkey,              // 32 bytes
+    /// PDA bump seed.
+    pub bump: u8,                   // 1 byte
+}
+// Total: 8 + 32 + 1 = 41 bytes
+
+#[derive(Accounts)]
+pub struct InitAdmin<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, RegistryConfig>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + AdminConfig::INIT_SPACE,
+        seeds = [b"admin"],
+        bump
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    /// The current operator bootstraps the admin exactly once (init fails after).
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct TransferAdmin<'info> {
+    #[account(
+        mut,
+        seeds = [b"admin"],
+        bump = admin_config.bump,
+        has_one = admin
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    pub admin: Signer<'info>,
+}
+
 #[event]
 pub struct AgentRegistered {
     pub agent_id: [u8; 32],
     pub did_hash: [u8; 32],
-    pub responsible_party: Pubkey,
+    pub owner_commitment: [u8; 32],
     pub timestamp: i64,
 }
 

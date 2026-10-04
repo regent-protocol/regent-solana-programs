@@ -21,23 +21,39 @@ witnessed by a chain no party to the transaction controls. Anyone holding a reco
 can recompute its hash, walk the Merkle proof to the root, and compare that root
 with what is on chain — without asking us for anything.
 
-Solana is a good fit because anchoring happens **per batch, continuously**. At that
-cadence, sub-cent fees and fast confirmation are what make per-batch anchoring
-viable rather than something to be saved up and batched for cost.
+Since October 2026 the roots are also chained: `audit-anchor` keeps one `AuditChain`
+account whose head is `sha256(head_prev ‖ batch_root ‖ seq)`, and `append_batch`
+refuses any sequence number but the next one and any `prev_head` but the current
+one. That makes the *series* provable, not just each batch — a batch cannot be
+dropped, reordered or altered without changing every head after it. Periodic
+`Epoch` accounts hold a Merkle root over a contiguous run of batch roots, so one
+event is verified with two short Merkle paths, and each epoch root is additionally
+stamped into Bitcoin through OpenTimestamps as a clock independent of both Solana
+and us.
+
+Solana is a good fit because anchoring happens **per batch, continuously**. With the
+chain, a batch costs one transaction fee and no rent, so the cadence is a latency
+decision rather than a cost one.
 
 ## The programs
 
 | Program | Devnet address | What it stores |
 |---|---|---|
-| `audit-anchor` | `8N1PpbJZKmvJjG86XWpP82XrWzp8HY5FHZuzyQTgjJas` | the Merkle root of a batch of audit events, with its batch id and timestamp |
-| `agent-registry` | `5jBmqyeo1vUAjHbEFuY59NMGTQR8cEe9Jvz2uCwCjp3L` | that an agent exists, the responsible party behind it, the DID hash, and revocation |
+| `audit-anchor` | `8N1PpbJZKmvJjG86XWpP82XrWzp8HY5FHZuzyQTgjJas` | the audit chain head and sequence (`["chain"]`), epoch roots over contiguous batch ranges (`["epoch", index]`), and the legacy per-batch root accounts (`["batch", batch_id]`) still written on devnet |
+| `agent-registry` | `5jBmqyeo1vUAjHbEFuY59NMGTQR8cEe9Jvz2uCwCjp3L` | that an agent exists, a commitment to its owner (`sha256(owner account id)` — never a wallet), the DID hash, and revocation |
 | `mandate-registry` | `8HAzw3UFGmabsHJkAsuGLfBZG8djYQ3J1FRNUVjkseMr` | that a spending mandate exists and which agent it binds to, and revocation |
 
 All three follow the same shape: a one-time `initialize` sets an operator
 authority in a `config` PDA (`seeds = ["config"]`), and every writing instruction
-is gated with `has_one = authority`. Records live in their own PDAs, derived from
-the record id — `["batch", batch_id]`, `["agent", agent_id]`, `["mandate", mandate_id]`
-— so anyone can compute where a record should be and read it directly.
+is gated with `has_one = authority`. A separate `AdminConfig` PDA (`["admin"]`)
+holds the admin, and only the admin can rotate the operator (`transfer_authority`)
+or hand over admin (`transfer_admin`); the operator is the hot key an automated
+anchor runs with, the admin is meant to be a multisig on hardware wallets, and a
+compromised operator can write records — which the audit trail exposes — but cannot
+lock anyone out or change who is in charge. Records live in their own PDAs,
+derived from the record id — `["batch", batch_id]`, `["agent", agent_id]`,
+`["mandate", mandate_id]` — so anyone can compute where a record should be and
+read it directly.
 
 ### What is deliberately *not* on chain
 
@@ -64,19 +80,30 @@ verification time:
 - Node — [`@regent-protocol/receipt-verify`](https://www.npmjs.com/package/@regent-protocol/receipt-verify)
 - Source — [regent-protocol/regent-receipt-verify](https://github.com/regent-protocol/regent-receipt-verify)
 
+Walking one audit event up to the chain — event → batch root → epoch root → the
+`AuditChain` and `Epoch` accounts, then the OpenTimestamps proof — is documented at
+[docs.regentprotocol.org/solana-programs/verification](https://docs.regentprotocol.org/solana-programs/verification);
+the proof bundle is served without authentication from `GET /v1/audit/events/{id}/proof`
+on `api.regentprotocol.org`, alongside `/v1/audit/chain` and `/v1/audit/epochs`.
+
 ## Status and security
 
 **Devnet.** `audit-anchor` has been anchoring production audit batches since
-12 April 2026, with no failed anchor transaction to date.
+12 April 2026, with no failed anchor transaction to date. The chain, epochs and
+admin split went live on 4 October 2026, and every batch anchored since April was
+appended to the chain in order; the head recomputed independently over all of them
+matches the account byte for byte.
 Mainnet deployment is planned *after* an independent security review, not before.
 
-Each program keeps two separate authorities, and both were rotated in
-September 2026 onto keys that have never been in a repository:
+Each program keeps three separate authorities, all on keys that have never been in
+a repository:
 
-- **Upgrade authority** may replace the program's code. Moved to an offline key
-  on 25 September.
+- **Upgrade authority** may replace the program's code. An offline key since
+  25 September 2026.
+- **Admin** (the `AdminConfig` PDA) may rotate the operator and hand over admin.
+  The same offline key on devnet; a multisig on mainnet.
 - **Operator authority** may write records. It lives in the `config` PDA and
-  gates every writing instruction through `has_one = authority`. Moved on
+  gates every writing instruction through `has_one = authority`. Rotated on
   26 September, once `transfer_authority` existed in all three programs —
   `agent-registry` had it from the first release, the other two did not, which
   meant the only way to rotate their operator was to redeploy under new program
